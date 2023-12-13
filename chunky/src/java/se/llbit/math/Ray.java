@@ -403,7 +403,9 @@ public class Ray {
     d.z = uz * tx + vz * ty + n.z * tz;
 
     o.scaleAdd(Ray.OFFSET, d);
-    if (!transmitBack) currentMaterial = prevMaterial; //if reflecting then passing though old media
+    //if a block is solid while transmiting then we want to keep the old material as it penetrates
+    // might be able to remove the solid check but test correctness and performance
+    if (!transmitBack | !currentMaterial.solid) currentMaterial = prevMaterial;
     specular = false;
 
     // See specularReflection for explanation of why this is needed
