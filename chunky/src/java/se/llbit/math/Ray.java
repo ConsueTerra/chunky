@@ -266,7 +266,7 @@ public class Ray {
     this.randomHemisphereDir(random);
 
     o.scaleAdd(Ray.OFFSET, d);
-    currentMaterial = prevMaterial;
+    if (!transmitBack) currentMaterial = prevMaterial; //if reflecting then passing though old media
     specular = false;
 
     // See specularReflection for explanation of why this is needed
