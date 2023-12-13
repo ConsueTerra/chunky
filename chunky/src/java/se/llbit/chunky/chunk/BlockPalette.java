@@ -528,16 +528,24 @@ public class BlockPalette {
       }
     });
     materialProperties.put("minecraft:small_amethyst_bud", block -> {
-      block.emittance = 1.0f / 15f;
+      if (block instanceof AmethystCluster && ((AmethystCluster) block).isLit()) {
+        block.emittance = 1.0f / 15f;
+      }
     });
     materialProperties.put("minecraft:medium_amethyst_bud", block -> {
-      block.emittance = 1.0f / 15f * 2;
+      if (block instanceof AmethystCluster && ((AmethystCluster) block).isLit()) {
+        block.emittance = 1.0f / 15f * 2;
+      }
     });
     materialProperties.put("minecraft:large_amethyst_bud", block -> {
-      block.emittance = 1.0f / 15f * 4;
+      if (block instanceof AmethystCluster && ((AmethystCluster) block).isLit()) {
+        block.emittance = 1.0f / 15f * 4;
+      }
     });
     materialProperties.put("minecraft:amethyst_cluster", block -> {
-      block.emittance = 1.0f / 15f * 5;
+      if (block instanceof AmethystCluster && ((AmethystCluster) block).isLit()) {
+        block.emittance = 1.0f / 15f * 5;
+      }
     });
     materialProperties.put("minecraft:tinted_glass", glassConfig);
     materialProperties.put("minecraft:sculk_sensor", block -> {

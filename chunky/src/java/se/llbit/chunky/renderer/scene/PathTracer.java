@@ -17,11 +17,13 @@
  */
 package se.llbit.chunky.renderer.scene;
 
+import org.apache.commons.math3.util.FastMath;
 import se.llbit.chunky.block.minecraft.Air;
 import se.llbit.chunky.block.minecraft.Water;
 import se.llbit.chunky.renderer.EmitterSamplingStrategy;
 import se.llbit.chunky.renderer.WorkerState;
 import se.llbit.chunky.world.Material;
+import se.llbit.chunky.world.VolumeMaterial;
 import se.llbit.math.*;
 
 import java.util.List;
@@ -64,7 +66,7 @@ public class PathTracer implements RayTracer {
 
     while (true) {
 
-      if (!PreviewRayTracer.nextIntersection(scene, ray)) {
+      if (!PreviewRayTracer.nextIntersection(scene, ray, random, IntersectionConfig.defaultIntersect(scene, false))) {
         if (ray.getPrevMaterial().isWater()) {
           ray.color.set(0, 0, 0, 1);
           hit = true;
@@ -83,7 +85,7 @@ public class PathTracer implements RayTracer {
         } else {
           // Indirect sky hit - diffuse color.
           scene.sky.getSkyColorDiffuseSun(ray, scene.getSunSamplingStrategy().isDiffuseSun());
-          // Skip sky fog - likely not noticeable in diffuse reflection.
+          addSkyFog(scene, ray, state, ox, od);
           hit = true;
         }
         break;
@@ -137,7 +139,10 @@ public class PathTracer implements RayTracer {
       int count = firstReflection ? scene.getCurrentBranchCount() : 1;
       for (int i = 0; i < count; i++) {
         boolean doMetal = pMetal > Ray.EPSILON && random.nextFloat() < pMetal;
-        if (doMetal || (pSpecular > Ray.EPSILON && random.nextFloat() < pSpecular)) {
+
+        if (currentMat instanceof VolumeMaterial) {
+          hit |= doParticleFogReflection(ray, next, (VolumeMaterial) currentMat, cumulativeColor, random, state, scene);
+        } else if (doMetal || (pSpecular > Ray.EPSILON && random.nextFloat() < pSpecular)) {
           hit |= doSpecularReflection(ray, next, cumulativeColor, doMetal, random, state, scene);
         } else if(random.nextFloat() < pDiffuse) {
           hit |= doDiffuseReflection(ray, next, currentMat, cumulativeColor, random, state, scene);
@@ -197,6 +202,109 @@ public class PathTracer implements RayTracer {
       scene.fog.addGroundFog(ray, ox, airDistance, state.attenuation, offset);
     }
 
+    return hit;
+  }
+
+  private static boolean doParticleFogReflection(Ray ray, Ray next, VolumeMaterial currentMat, Vector4 cumulativeColor, Random random, WorkerState state, Scene scene) {
+    boolean hit = false;
+    Vector3 emittance = new Vector3();
+    next.set(ray);
+    Vector3 inboundDirection = new Vector3(ray.d);
+    inboundDirection.scale(-1);
+
+    if (scene.emittersEnabled && currentMat.emittance > Ray.EPSILON) {
+      // Quadratic emittance mapping, so a pixel that's 50% darker will emit only 25% as much light
+      // This is arbitrary but gives pretty good results in most cases.
+      emittance = new Vector3(ray.color.x * ray.color.x, ray.color.y * ray.color.y, ray.color.z * ray.color.z);
+      emittance.scale(currentMat.emittance * scene.emitterIntensity);
+      hit = true;
+    }
+
+    if (scene.getSunSamplingStrategy().doSunSampling()) {
+      scene.sun.getRandomSunDirection(next, random);
+      double cosTheta = inboundDirection.dot(next.d);
+
+      double directLightR = 0;
+      double directLightG = 0;
+      double directLightB = 0;
+
+      next.setCurrentMaterial(next.getPrevMaterial(), next.getPrevData());
+
+      getDirectLightAttenuation(scene, next, state);
+
+      Vector4 attenuation = state.attenuation;
+      if (attenuation.w > 0) {
+        double mult = phaseHG(cosTheta, currentMat.anisotropy) * (scene.getSunSamplingStrategy().isSunLuminosity() ? scene.sun().getLuminosityPdf() : 1);
+        directLightR = attenuation.x * attenuation.w * mult;
+        directLightG = attenuation.y * attenuation.w * mult;
+        directLightB = attenuation.z * attenuation.w * mult;
+        hit = true;
+      }
+
+      next.set(ray);
+      Vector3 outboundDirection = new Vector3();
+      double x1 = random.nextDouble();
+      double x2 = random.nextDouble();
+      henyeyGreensteinSampleP(currentMat.anisotropy, inboundDirection, outboundDirection, x1, x2);
+      next.d.set(outboundDirection);
+      next.d.normalize();
+
+      hit |= pathTrace(scene, next, state, false);
+      if (hit) {
+        cumulativeColor.x += emittance.x + ray.color.x * (directLightR * scene.sun.emittance.x + next.color.x);
+        cumulativeColor.y += emittance.y + ray.color.y * (directLightG * scene.sun.emittance.y + next.color.y);
+        cumulativeColor.z += emittance.z + ray.color.z * (directLightB * scene.sun.emittance.z + next.color.z);
+      }
+    } else {
+      if(Math.abs(currentMat.anisotropy) < 0.99 && scene.getSunSamplingStrategy().isImportanceSampling()) {
+        double sun_az = scene.sun().getAzimuth();
+        double sun_alt_fake = scene.sun().getAltitude();
+        double sun_alt = Math.abs(sun_alt_fake) > Math.PI / 2 ? Math.signum(sun_alt_fake) * Math.PI - sun_alt_fake : sun_alt_fake;
+        double circle_radius = scene.sun().getSunRadius() * scene.sun().getImportanceSampleRadius() * 1.1;
+        double sample_chance = scene.sun().getImportanceSampleChance();
+        double sample_area_proportion = (1 - FastMath.cos(circle_radius)) / 2;
+        double ay;
+        if(random.nextDouble() < sample_chance) {
+          // Generate random sun direction assuming sun is directly overhead
+          ay = 1 - random.nextDouble() * (1 - FastMath.cos(circle_radius));
+        } else {
+          // Generate random non-sun direction assuming sun is directly overhead
+          ay = -1 + random.nextDouble() * (1 + FastMath.cos(circle_radius));
+          // Invert proportions
+          sample_chance = 1 - sample_chance;
+          sample_area_proportion = 1 - sample_area_proportion;
+        }
+        double phi = random.nextDouble() * 2 * Math.PI;
+        double ax = FastMath.sqrt(1 - ay * ay) * FastMath.sin(phi);
+        double az = FastMath.sqrt(1 - ay * ay) * FastMath.cos(phi);
+        // Transform to actual sun position
+        double bx = ax * FastMath.sin(sun_alt) + ay * FastMath.cos(sun_alt);
+        double by = -ax * FastMath.cos(sun_alt) + ay * FastMath.sin(sun_alt);
+        double cx = bx * FastMath.cos(sun_az) - az * FastMath.sin(sun_az);
+        double cz = bx * FastMath.sin(sun_az) + az * FastMath.cos(sun_az);
+        next.d.set(cx, by, cz);
+        double pdf4pi = phaseHG(inboundDirection.dot(next.d), currentMat.anisotropy) * 4 * Math.PI;
+        hit |= pathTrace(scene, next, state, false);
+        if(hit) {
+          cumulativeColor.x += (emittance.x + ray.color.x * (next.color.x)) * pdf4pi * sample_area_proportion / sample_chance;
+          cumulativeColor.y += (emittance.y + ray.color.y * (next.color.y)) * pdf4pi * sample_area_proportion / sample_chance;
+          cumulativeColor.z += (emittance.z + ray.color.z * (next.color.z)) * pdf4pi * sample_area_proportion / sample_chance;
+        }
+      } else {
+        Vector3 outboundDirection = new Vector3();
+        double x1 = random.nextDouble();
+        double x2 = random.nextDouble();
+        henyeyGreensteinSampleP(currentMat.anisotropy, inboundDirection, outboundDirection, x1, x2);
+        next.d.set(outboundDirection);
+        next.d.normalize();
+        hit |= pathTrace(scene, next, state, false);
+        if (hit) {
+          cumulativeColor.x += emittance.x + ray.color.x * (next.color.x);
+          cumulativeColor.y += emittance.y + ray.color.y * (next.color.y);
+          cumulativeColor.z += emittance.z + ray.color.z * (next.color.z);
+        }
+      }
+    }
     return hit;
   }
 
@@ -296,7 +404,7 @@ public class PathTracer implements RayTracer {
         }
       }
 
-      next.diffuseLobes(ray, random, transmitBack);
+      next.diffuseLobes(ray, random, transmitBack,scene);
       hit = pathTrace(scene, next, state, false) || hit;
       if (hit) {
         cumulativeColor.x += emittance.x + ray.color.x * (directLightR * scene.sun.emittance.x + next.color.x + indirectEmitterColor.x);
@@ -310,7 +418,9 @@ public class PathTracer implements RayTracer {
       }
 
     } else {
-      next.diffuseLobes(ray, random, transmitBack);
+      // If diffuse sun sampling is performed, then ray.color will be altered, but it should be the same on each iteration of ray branching
+      Vector4 rayColor = new Vector4(ray.color);
+      next.diffuseLobes(ray, random,transmitBack, scene);
 
       hit = pathTrace(scene, next, state, false) || hit;
       if (hit) {
@@ -323,6 +433,7 @@ public class PathTracer implements RayTracer {
         cumulativeColor.y += ray.color.y * indirectEmitterColor.y;
         cumulativeColor.z += ray.color.z * indirectEmitterColor.z;
       }
+      ray.color.set(rayColor);
     }
     //fix the normal if inverted for use in other things
     if (transmitBack) {
@@ -489,7 +600,7 @@ public class PathTracer implements RayTracer {
 
       emitterRay.o.scaleAdd(Ray.OFFSET, emitterRay.d);
       emitterRay.distance += Ray.OFFSET;
-      PreviewRayTracer.nextIntersection(scene, emitterRay);
+      PreviewRayTracer.nextIntersection(scene, emitterRay, random, IntersectionConfig.defaultIntersect(scene, false));
       if (Math.abs(emitterRay.distance - distance) < Ray.OFFSET) {
         double e = Math.abs(emitterRay.d.dot(emitterRay.getNormal()));
         e /= Math.max(distance * distance, 1);
@@ -545,7 +656,7 @@ public class PathTracer implements RayTracer {
     attenuation.w = 1;
     while (attenuation.w > Ray.EPSILON) {
       ray.o.scaleAdd(Ray.OFFSET, ray.d);
-      if (!PreviewRayTracer.nextIntersection(scene, ray)) {
+      if (!PreviewRayTracer.nextIntersection(scene, ray, state.random, IntersectionConfig.defaultIntersect(scene, false))) {
         break;
       }
       Material mat = ray.getCurrentMaterial();
@@ -567,6 +678,68 @@ public class PathTracer implements RayTracer {
         attenuation.w = 0;
       }
     }
+  }
+
+  private static final double INV_4_PI = 1 / (4 * FastMath.PI);
+
+  /**
+   * Code adapted from <a href="https://github.com/mmp/pbrt-v3/blob/b47ed0d334cde4c475def0044c974b7db173ff99/src/core/medium.h#L69">pbrt</a>
+   */
+  private static double phaseHG(double cosTheta, double g) {
+    double denominator = 1 + g * g + 2 * g * cosTheta;
+    return INV_4_PI * (1 - g * g) / (denominator * FastMath.sqrt(denominator));
+  }
+
+  /**
+   * Code adapted from <a href="https://github.com/mmp/pbrt-v3/blob/b47ed0d334cde4c475def0044c974b7db173ff99/src/core/medium.cpp#L193">pbrt</a>
+   */
+  private static double henyeyGreensteinSampleP(double g, Vector3 wo, Vector3 wi, double x1, double x2) {
+    double cosTheta;
+    if (FastMath.abs(g) < 1e-3) {
+      cosTheta = 1 - 2 * x1;
+    } else {
+      double sqrTerm = (1 - g * g) / (1 + g - 2 * g * x1);
+      cosTheta = -(1 + g * g - sqrTerm * sqrTerm) / (2 * g);
+    }
+
+    double sinTheta = FastMath.sqrt(FastMath.max(0d, 1 - cosTheta * cosTheta));
+    double phi = 2 * FastMath.PI * x2;
+    Vector3 v1 = new Vector3();
+    Vector3 v2 = new Vector3();
+    coordinateSystem(wo, v1, v2);
+    wi.set(sphericalDirection(sinTheta, cosTheta, phi, v1, v2, wo));
+    return phaseHG(cosTheta, g);
+  }
+
+  /**
+   * Code adapted from <a href="https://github.com/mmp/pbrt-v3/blob/b47ed0d334cde4c475def0044c974b7db173ff99/src/core/geometry.h#L1020">pbrt</a>
+   */
+  private static void coordinateSystem(Vector3 v1, Vector3 v2, Vector3 v3) {
+    Vector3 x;
+    if (FastMath.abs(v1.x) > FastMath.abs(v1.y)) {
+      x = new Vector3(-v1.z, 0, v1.x);
+      x.scale(1 / FastMath.sqrt(v1.x * v1.x + v1.z * v1.z));
+    } else {
+      x = new Vector3(0, v1.z, -v1.y);
+      x.scale(1 / FastMath.sqrt(v1.y * v1.y + v1.z * v1.z));
+    }
+    v2.set(x);
+    v3.cross(v1, v2);
+  }
+
+  /**
+   * Code adapted from <a href="https://github.com/mmp/pbrt-v3/blob/b47ed0d334cde4c475def0044c974b7db173ff99/src/core/geometry.h#L1465C25-L1465C25">pbrt</a>
+   */
+  private static Vector3 sphericalDirection(double sinTheta, double cosTheta, double phi, Vector3 x, Vector3 y, Vector3 z) {
+    Vector3 x1 = new Vector3(x);
+    Vector3 y1 = new Vector3(y);
+    Vector3 z1 = new Vector3(z);
+    x1.scale(sinTheta * FastMath.cos(phi));
+    y1.scale(sinTheta * FastMath.sin(phi));
+    z1.scale(cosTheta);
+    x1.add(y1);
+    x1.add(z1);
+    return x1;
   }
 
 }
